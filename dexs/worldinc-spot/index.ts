@@ -20,62 +20,11 @@ function parseSpotMatchQuantities(smq: bigint) {
   return { fromFee, toFee, fromQuantity, toQuantity };
 }
 
-// Helper function to parse spot match data
-function parseSpotMatchData(smd: bigint) {
-  const MASK_32 = BigInt("0xFFFFFFFF");
-  const MASK_64 = BigInt("0xFFFFFFFFFFFFFFFF");
-  const MASK_1 = BigInt("1");
-  const tradeSeq = smd & MASK_32;
-  const sellerOrderId = (smd >> 32n) & MASK_64;
-  const buyerOrderId = (smd >> 96n) & MASK_64;
-  const priceRaw = (smd >> 160n) & MASK_64;
-  const buyerIsMaker = ((smd >> 224n) & MASK_1) !== 0n;
-  return { tradeSeq, sellerOrderId, buyerOrderId, priceRaw, buyerIsMaker };
-}
-
-// Helper function to parse price (BigInt arithmetic to avoid precision loss; mantissa can be up to 59 bits)
-function parsePrice59EN5(p: bigint): number {
-  const PRICE_EXP_MASK = BigInt("0x1F");
-  const exponent = Number(p & PRICE_EXP_MASK);
-  const mantissa = p >> 5n;
-  const denom = 10n ** BigInt(exponent);
-  const intPart = mantissa / denom;
-  const rem = mantissa % denom;
-  const frac = Number(rem) / Math.pow(10, exponent);
-  return Number(intPart) + frac;
-}
-
-// Helper function to parse volume from spot trade event
-function parseSpotPerpVolume(
-  event: any,
-  orderbookConfig: { baseId?: number; quoteId?: number; type: string },
-  tokenDecimals: Record<number, number>
-): number {
-  const { spotMatchQuantities, spotMatchData } = event;
-
-  if (!spotMatchQuantities || !spotMatchData) {
-    return 0;
-  }
-
-  const qtyData = parseSpotMatchQuantities(BigInt(spotMatchQuantities));
-  const metaData = parseSpotMatchData(BigInt(spotMatchData));
-  const price = parsePrice59EN5(metaData.priceRaw);
-
-  const quoteDecimals = orderbookConfig.quoteId ? (tokenDecimals[orderbookConfig.quoteId] || 8) : 8;
-  const baseDecimals = orderbookConfig.baseId ? (tokenDecimals[orderbookConfig.baseId] || 8) : 8;
-  const quoteFactor = 10n ** BigInt(quoteDecimals);
-  const baseFactor = 10n ** BigInt(baseDecimals);
-
-  let volume = 0;
-
-  if (qtyData.toQuantity > 0n) {
-    volume = Number(qtyData.toQuantity / quoteFactor) + Number(qtyData.toQuantity % quoteFactor) / Number(quoteFactor);
-  } else if (qtyData.fromQuantity > 0n) {
-    const baseAmount = Number(qtyData.fromQuantity / baseFactor) + Number(qtyData.fromQuantity % baseFactor) / Number(baseFactor);
-    volume = baseAmount * price;
-  }
-
-  return volume;
+/** Convert position-denominated raw amount to ERC20 raw (smallest unit). */
+function positionRawToErc20Raw(raw: bigint, positionDecimals: number, erc20Decimals: number): bigint {
+  if (positionDecimals === erc20Decimals) return raw;
+  if (erc20Decimals >= positionDecimals) return raw * 10n ** BigInt(erc20Decimals - positionDecimals);
+  return raw / 10n ** BigInt(positionDecimals - erc20Decimals);
 }
 
 // Helper function to decode token config
@@ -103,7 +52,7 @@ function decodeVaultTokenConfig(vtc: bigint) {
   };
 }
 
-// Discover spot orderbooks via contract view getSpotOrderBook(token1, token2) (same as example/points-indexer/fetch_metadata.js)
+// Discover spot orderbooks via contract view getSpotOrderBook(token1, token2)
 async function getSpotOrderbooks(
   _getLogs: any,
   api: any,
@@ -111,6 +60,8 @@ async function getSpotOrderbooks(
 ): Promise<{
   orderbooks: string[];
   tokenDecimals: Record<number, number>;
+  tokenErc20Decimals: Record<number, number>;
+  tokenAddresses: Record<number, string>;
   orderbookConfigs: Record<string, { baseId?: number; quoteId?: number; type: string }>;
 }> {
   const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
@@ -152,6 +103,8 @@ async function getSpotOrderbooks(
 
   const finalOrderbooks = Array.from(orderbooks);
   const tokenDecimals: Record<number, number> = {};
+  const tokenErc20Decimals: Record<number, number> = {};
+  const tokenAddresses: Record<number, string> = {};
 
   const tokenConfigCalls = Array.from(tokenIds).map((tokenId) => ({
     target: exchangeAddress,
@@ -168,37 +121,40 @@ async function getSpotOrderbooks(
     if (tokenConfigs[index] && tokenConfigs[index] !== 0n) {
       const config = decodeVaultTokenConfig(BigInt(tokenConfigs[index]));
       tokenDecimals[tokenId] = config.positionDecimals;
+      tokenErc20Decimals[tokenId] = config.erc20Decimals || config.positionDecimals;
+      if (config.tokenAddress && config.tokenAddress !== ZERO_ADDRESS) tokenAddresses[tokenId] = config.tokenAddress;
     } else {
       tokenDecimals[tokenId] = 8;
+      tokenErc20Decimals[tokenId] = 8;
     }
   });
 
-  return { orderbooks: finalOrderbooks, tokenDecimals, orderbookConfigs };
+  return { orderbooks: finalOrderbooks, tokenDecimals, tokenErc20Decimals, tokenAddresses, orderbookConfigs };
 }
 
-const fetch = async ({ getLogs, api, getFromBlock, getToBlock }: FetchOptions): Promise<FetchResultVolume> => {
-  let orderbookData: {
-    orderbooks: string[];
-    tokenDecimals: Record<number, number>;
-    orderbookConfigs: Record<string, any>;
-  } | null = null;
+const ZERO = "0x0000000000000000000000000000000000000000";
 
+const fetch = async (options: FetchOptions): Promise<FetchResultVolume> => {
+  const { getLogs, api, getFromBlock, getToBlock, createBalances } = options;
+  const dailyVolume = createBalances();
+
+  let orderbookData: Awaited<ReturnType<typeof getSpotOrderbooks>> | null = null;
   try {
     orderbookData = await getSpotOrderbooks(getLogs, api, COMPOSITE_EXCHANGE);
   } catch (e) {
-    return { dailyVolume: 0 };
+    return { dailyVolume };
   }
 
-  const { orderbooks: orderbookAddresses, tokenDecimals, orderbookConfigs } = orderbookData;
+  const { orderbooks: orderbookAddresses, tokenDecimals, tokenErc20Decimals, tokenAddresses, orderbookConfigs } = orderbookData;
 
   if (orderbookAddresses.length === 0) {
-    return { dailyVolume: 0 };
+    return { dailyVolume };
   }
 
   let fromBlock = await getFromBlock();
   const toBlock = await getToBlock();
   if (fromBlock == null || toBlock == null) {
-    return { dailyVolume: 0 };
+    return { dailyVolume };
   }
   fromBlock = Math.max(fromBlock, EXCHANGE_START_BLOCK);
 
@@ -213,23 +169,45 @@ const fetch = async ({ getLogs, api, getFromBlock, getToBlock }: FetchOptions): 
       skipIndexer: true,
     });
 
-    const volumes = spotLogs.map((log: any) => {
+    const volumeByTokenIdRaw: Record<number, bigint> = {};
+    function addVolumeRaw(tokenId: number, rawErc20: bigint) {
+      if (!volumeByTokenIdRaw[tokenId]) volumeByTokenIdRaw[tokenId] = 0n;
+      volumeByTokenIdRaw[tokenId] += rawErc20;
+    }
+
+    // One leg pays base (fromQuantity), one pays quote (toQuantity); different assets, not double-counting.
+    for (const log of spotLogs as any[]) {
       const eventData = log.args || log.parsedLog?.args || log;
-      if (!eventData.spotMatchQuantities && !eventData.spotMatchData) {
-        return 0;
-      }
+      if (!eventData.spotMatchQuantities) continue;
 
       const orderbookAddr = (log.address || log.srcAddress || log.target)?.toLowerCase();
-      const orderbookConfig = orderbookConfigs[orderbookAddr] || { type: "UNKNOWN" };
+      const config = orderbookConfigs[orderbookAddr];
+      if (!config?.baseId || !config?.quoteId) continue;
 
-      return parseSpotPerpVolume(eventData, orderbookConfig, tokenDecimals);
-    });
+      const qty = parseSpotMatchQuantities(BigInt(eventData.spotMatchQuantities));
+      const basePosD = tokenDecimals[config.baseId] ?? 8;
+      const quotePosD = tokenDecimals[config.quoteId] ?? 8;
+      const baseErc = tokenErc20Decimals[config.baseId] ?? basePosD;
+      const quoteErc = tokenErc20Decimals[config.quoteId] ?? quotePosD;
 
-    const dailyVolume = volumes.reduce((sum, volume) => sum + volume, 0);
+      if (qty.fromQuantity > 0n) {
+        addVolumeRaw(config.baseId, positionRawToErc20Raw(qty.fromQuantity, basePosD, baseErc));
+      }
+      if (qty.toQuantity > 0n) {
+        addVolumeRaw(config.quoteId, positionRawToErc20Raw(qty.toQuantity, quotePosD, quoteErc));
+      }
+    }
+
+    for (const [tokenIdStr, raw] of Object.entries(volumeByTokenIdRaw)) {
+      const tokenId = Number(tokenIdStr);
+      const addr = tokenAddresses[tokenId];
+      if (!addr || addr === ZERO || raw === 0n) continue;
+      dailyVolume.add(addr, raw);
+    }
 
     return { dailyVolume };
   } catch (e) {
-    return { dailyVolume: 0 };
+    return { dailyVolume };
   }
 };
 
@@ -237,7 +215,7 @@ const adapter: SimpleAdapter = {
   version: 2,
   fetch,
   chains: [CHAIN.MEGAETH],
-  start: "2026-02-09",
+  start: "2026-02-01",
 };
 
 export default adapter;
